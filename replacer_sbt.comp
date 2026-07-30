@@ -1,0 +1,115 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+
+/// -> hash.glsl
+uint xxhash32(uint lhs, uint rhs)
+{
+    const uint PRIME32_2 = 2246822519U, PRIME32_3 = 3266489917U;
+    const uint PRIME32_4 = 668265263U, PRIME32_5 = 374761393U;
+    uint h32 = lhs + PRIME32_5 + rhs * PRIME32_3;
+    h32 = PRIME32_4 * ((h32 << 17) | (h32 >> (32 - 17)));
+    h32 = PRIME32_2 * (h32 ^ (h32 >> 15));
+    h32 = PRIME32_3 * (h32 ^ (h32 >> 13));
+    return h32 ^ (h32 >> 16);
+}
+
+//! xxhash32 for arrays of uint32_t
+#define DEFINE_XXHASH32(LEN)                   \
+    uint xxhash32(const uint key[LEN], uint h) \
+    {                                          \
+        for (uint i = 0; i < LEN; ++i)         \
+        {                                      \
+            h = xxhash32(key[i], h);           \
+        }                                      \
+        return h;                              \
+    }                                          \
+/// hash.glsl
+
+DEFINE_XXHASH32(8);
+
+// 32-byte wide opaque handle
+struct shader_group_handle_t
+{
+    uint data[8];
+};
+const shader_group_handle_t k_null_handle = shader_group_handle_t(uint[](0, 0, 0, 0, 0, 0, 0, 0));
+
+bool equal(const shader_group_handle_t lhs, const shader_group_handle_t rhs)
+{
+    for(uint i = 0; i < 8; ++i)
+    {
+        if(lhs.data[i] != rhs.data[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_null(const shader_group_handle_t h){ return equal(h, k_null_handle); }
+
+struct hashmap_item_t
+{
+    shader_group_handle_t key;
+    shader_group_handle_t value;
+};
+layout(buffer_reference, std430) buffer readonly HashMapStorage{ hashmap_item_t v[]; };
+
+//! 16 bytes
+struct hashmap_t
+{
+    HashMapStorage storage;
+    uint size;
+    uint capacity;
+};
+
+uint hash(const shader_group_handle_t group_handle)
+{
+    return xxhash32(group_handle.data, 0);
+}
+
+shader_group_handle_t get(const hashmap_t hashmap, const shader_group_handle_t key)
+{
+    if(is_null(key) || hashmap.capacity == 0) { return k_null_handle; }
+
+    for(uint idx = hash(key);; idx++)
+    {
+        idx &= hashmap.capacity - 1;
+        const hashmap_item_t item = hashmap.storage.v[idx];
+        if(is_null(item.key)) { return k_null_handle; }
+        else if(equal(key, item.key) && !is_null(item.value)) { return item.value; }
+    }
+}
+
+layout(buffer_reference, std430) buffer GroupHandlePtr{ shader_group_handle_t group_handle; };
+
+layout(buffer_reference, std430) buffer readonly AddressArray{ GroupHandlePtr v[]; };
+
+struct replacer_params_t
+{
+    hashmap_t shader_group_handle_map;
+
+    // input-/output-arrays can be identical when sbt-alignments/strides match
+    AddressArray input_handles, output_handles;
+    uint num_handles;
+};
+
+layout(push_constant, std430) uniform pc
+{
+    replacer_params_t params;
+};
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if(gid >= params.num_handles){ return; }
+
+    // hashmap lookup
+    shader_group_handle_t input_handle = params.input_handles.v[gid].group_handle;
+    shader_group_handle_t result = get(params.shader_group_handle_map, input_handle);
+
+    // write remapped or original value to output-array
+    params.output_handles.v[gid].group_handle = is_null(result) ? input_handle : result;
+}

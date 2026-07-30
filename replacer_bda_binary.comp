@@ -1,0 +1,187 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+/// -> hash.glsl
+uint xxhash32(uint lhs, uint rhs)
+{
+    const uint PRIME32_2 = 2246822519U, PRIME32_3 = 3266489917U;
+    const uint PRIME32_4 = 668265263U, PRIME32_5 = 374761393U;
+    uint h32 = lhs + PRIME32_5 + rhs * PRIME32_3;
+    h32 = PRIME32_4 * ((h32 << 17) | (h32 >> (32 - 17)));
+    h32 = PRIME32_2 * (h32 ^ (h32 >> 15));
+    h32 = PRIME32_3 * (h32 ^ (h32 >> 13));
+    return h32 ^ (h32 >> 16);
+}
+
+bool is_null(const uint64_t h){ return h == 0ul; }
+const uint64_t k_null_handle = 0ul;
+
+struct hashmap_item_t
+{
+    uint64_t key;
+    uint64_t value;
+};
+layout(buffer_reference, std430) buffer readonly HashMapStorage{ hashmap_item_t v[]; };
+
+//! 16 bytes
+// struct hashmap_t
+layout(buffer_reference, std430) buffer HashMapPtr
+{
+    HashMapStorage storage;
+    uint size;
+    uint capacity;
+};
+
+uint hash(uint64_t device_address)
+{
+    const uint64_t mask32 = 4294967295ul;
+    return xxhash32(uint(device_address >> 32ul), xxhash32(uint(device_address & mask32), 0));
+}
+
+uint64_t hashmap_get(const HashMapPtr hashmap, const uint64_t key)
+{
+    if(is_null(key) || hashmap.capacity == 0) { return k_null_handle; }
+
+    for(uint idx = hash(key);; idx++)
+    {
+        idx &= hashmap.capacity - 1;
+        const hashmap_item_t item = hashmap.storage.v[idx];
+        if(is_null(item.key)) { return k_null_handle; }
+        else if(key == item.key && !is_null(item.value)) { return item.value; }
+    }
+}
+
+void hashmap_set(const HashMapPtr hashmap, const uint64_t key, const uint64_t value)
+{
+    if(is_null(key) || hashmap.capacity == 0) { return; }
+
+    for(uint idx = hash(key);; idx++)
+    {
+        idx &= hashmap.capacity - 1;
+        uint64_t probed_key = hashmap.storage.v[idx].key;
+        if(probed_key != key)
+        {
+            // hit another valid entry, keep probing
+            if(!is_null(probed_key) && !is_null(hashmap.storage.v[idx].value)) { continue; }
+
+            // try to insert atomically
+            probed_key = atomicCompSwap(hashmap.storage.v[idx].key, probed_key, key);
+            if(!is_null(probed_key) && probed_key != key)
+            {
+                // another thread just stole it
+                continue;
+            }
+            // atomically increase size
+            atomicAdd(hashmap.size, 1);
+        }
+        hashmap.storage.v[idx].value = value;
+        return;
+    }
+}
+
+struct storage_item_t
+{
+    uint64_t key;
+    uint64_t value;
+    uint64_t size;
+
+};
+layout(buffer_reference, scalar) buffer readonly Storage{ storage_item_t v[]; };
+
+struct sorted_array_t
+{
+    Storage storage;
+    uint num_items;
+    uint padding;
+};
+
+//! perform a binary search, take into account offsets
+uint64_t map_address(const sorted_array_t array, uint64_t capture_address)
+{
+    if(array.num_items == 0){ return k_null_handle; }
+    uint low = 0, high = array.num_items - 1;
+    uint mid;
+    while(low <= high)
+    {
+        mid = low + (high - low) / 2;
+
+        if(capture_address >= array.storage.v[mid].key &&
+           capture_address < (array.storage.v[mid].key + max(array.storage.v[mid].size, 1ul)))
+        {
+            // offset calculation
+            uint64_t offset = capture_address - array.storage.v[mid].key;
+            return array.storage.v[mid].value + offset;
+        }
+        else if(capture_address < array.storage.v[mid].key){ high = mid - 1; }
+        else { low = mid + 1;}
+    }
+    return k_null_handle;
+}
+
+layout(buffer_reference, std430) buffer readonly AddressArray{ uint64_t v[]; };
+
+struct replacer_params_bda_t
+{
+    sorted_array_t device_address_array;
+    HashMapPtr address_blacklist;
+
+    // input-/output-arrays 'can' be identical
+    AddressArray input_handles;
+    AddressArray output_handles;
+    uint num_handles;
+};
+
+layout(push_constant, std430) uniform pc
+{
+    replacer_params_bda_t params;
+};
+
+layout(buffer_reference, std430) buffer BufferDeviceAddressPtr{ uint64_t buffer_device_address; };
+layout(buffer_reference, std430) buffer PaddedBufferDeviceAddressPtr{ uint pad; uint64_t buffer_device_address; };
+
+//! helper to read a VkDeviceAddress from address 'ptr', read-access is 8-byte aligned
+uint64_t read_address(uint64_t ptr)
+{
+    return (ptr & 7UL) != 0 ? PaddedBufferDeviceAddressPtr(ptr & ~7).buffer_device_address :
+                              BufferDeviceAddressPtr(ptr).buffer_device_address;
+}
+
+//! helper to write a VkDeviceAddress to address 'ptr', write-access is 8-byte aligned
+void write_address(uint64_t ptr, uint64_t value)
+{
+    if((ptr & 7UL) != 0)
+    {
+        PaddedBufferDeviceAddressPtr pad_helper = PaddedBufferDeviceAddressPtr(ptr & ~7);
+        pad_helper.buffer_device_address = value;
+    }
+    else
+    {
+        BufferDeviceAddressPtr(ptr).buffer_device_address = value;
+    }
+}
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if(gid >= params.num_handles){ return; }
+
+    uint64_t input_address = read_address(params.input_handles.v[gid]);
+
+    // check if we have replaced + cached this address already, avoid double-replacements
+    if(hashmap_get(params.address_blacklist, params.input_handles.v[gid]) != input_address)
+    {
+        // binary-search lookup
+        uint64_t result = map_address(params.device_address_array, input_address);
+
+        // keep track of mapped address
+        hashmap_set(params.address_blacklist, params.input_handles.v[gid], result);
+
+        // write remapped or original value to output-array
+        write_address(params.output_handles.v[gid], is_null(result) ? input_address : result);
+    }
+}

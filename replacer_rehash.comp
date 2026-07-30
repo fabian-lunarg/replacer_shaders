@@ -1,0 +1,107 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+/// -> hash.glsl
+uint xxhash32(uint lhs, uint rhs)
+{
+    const uint PRIME32_2 = 2246822519U, PRIME32_3 = 3266489917U;
+    const uint PRIME32_4 = 668265263U, PRIME32_5 = 374761393U;
+    uint h32 = lhs + PRIME32_5 + rhs * PRIME32_3;
+    h32 = PRIME32_4 * ((h32 << 17) | (h32 >> (32 - 17)));
+    h32 = PRIME32_2 * (h32 ^ (h32 >> 15));
+    h32 = PRIME32_3 * (h32 ^ (h32 >> 13));
+    return h32 ^ (h32 >> 16);
+}
+
+bool is_null(const uint64_t h){ return h == 0ul; }
+const uint64_t k_null_handle = 0ul;
+
+struct hashmap_item_t
+{
+    uint64_t key;
+    uint64_t value;
+};
+layout(buffer_reference, std430) buffer readonly HashMapStorage{ hashmap_item_t v[]; };
+
+//! 16 bytes
+// struct hashmap_t
+layout(buffer_reference, std430) buffer HashMapPtr
+{
+    HashMapStorage storage;
+    uint size;
+    uint capacity;
+};
+
+uint hash(uint64_t device_address)
+{
+    const uint64_t mask32 = 4294967295ul;
+    return xxhash32(uint(device_address >> 32ul), xxhash32(uint(device_address & mask32), 0));
+}
+
+uint64_t hashmap_get(const HashMapPtr hashmap, const uint64_t key)
+{
+    if(is_null(key) || hashmap.capacity == 0) { return k_null_handle; }
+
+    for(uint idx = hash(key);; idx++)
+    {
+        idx &= hashmap.capacity - 1;
+        const hashmap_item_t item = hashmap.storage.v[idx];
+        if(is_null(item.key)) { return k_null_handle; }
+        else if(key == item.key && !is_null(item.value)) { return item.value; }
+    }
+}
+
+void hashmap_set(const HashMapPtr hashmap, const uint64_t key, const uint64_t value)
+{
+    if(is_null(key) || hashmap.capacity == 0) { return; }
+
+    for(uint idx = hash(key);; idx++)
+    {
+        idx &= hashmap.capacity - 1;
+        uint64_t probed_key = hashmap.storage.v[idx].key;
+        if(probed_key != key)
+        {
+            // hit another valid entry, keep probing
+            if(!is_null(probed_key) && !is_null(hashmap.storage.v[idx].value)) { continue; }
+
+            // try to insert atomically
+            probed_key = atomicCompSwap(hashmap.storage.v[idx].key, probed_key, key);
+            if(!is_null(probed_key) && probed_key != key)
+            {
+                // another thread just stole it
+                continue;
+            }
+            // atomically increase size
+            atomicAdd(hashmap.size, 1);
+        }
+        hashmap.storage.v[idx].value = value;
+        return;
+    }
+}
+
+struct rehash_params
+{
+    HashMapPtr hashmap_old;
+    HashMapPtr hashmap_new;
+};
+
+layout(push_constant, std430) uniform pc
+{
+    rehash_params params;
+};
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if(gid >= params.hashmap_old.capacity){ return; }
+
+    // insert entries from hashmap_old into hashmap_new
+    uint64_t key = params.hashmap_old.storage.v[gid].key;
+    uint64_t value = params.hashmap_old.storage.v[gid].value;
+    hashmap_set(params.hashmap_new, key, value);
+}
