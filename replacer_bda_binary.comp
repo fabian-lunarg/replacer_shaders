@@ -139,8 +139,8 @@ layout(push_constant, std430) uniform pc
     replacer_params_bda_t params;
 };
 
-layout(buffer_reference, std430) buffer BufferDeviceAddressPtr{ uint64_t buffer_device_address; };
-layout(buffer_reference, std430) buffer PaddedBufferDeviceAddressPtr{ uint pad; uint64_t buffer_device_address; };
+layout(buffer_reference, buffer_reference_align = 8, std430) buffer BufferDeviceAddressPtr{ uint64_t buffer_device_address; };
+layout(buffer_reference, buffer_reference_align = 8, std430) buffer PaddedBufferDeviceAddressPtr{ uint pad; uint64_t buffer_device_address; };
 
 //! helper to read a VkDeviceAddress from address 'ptr', read-access is 8-byte aligned
 uint64_t read_address(uint64_t ptr)
