@@ -119,6 +119,22 @@ uint64_t map_address(sorted_array_t array, uint64_t capture_address)
 }
 
 // ---- replacer_bda: remap buffer device addresses via binary search + blacklist ----
+
+// read a VkDeviceAddress from 4-byte aligned address 'ptr', as two 32-bit words
+uint64_t read_address(uint64_t *ptr)
+{
+    uint *words = (uint *)ptr;
+    return uint64_t(words[0]) | (uint64_t(words[1]) << 32);
+}
+
+// write a VkDeviceAddress to 4-byte aligned address 'ptr', as two 32-bit words
+void write_address(uint64_t *ptr, uint64_t value)
+{
+    uint *words = (uint *)ptr;
+    words[0] = uint(value);
+    words[1] = uint(value >> 32);
+}
+
 struct replacer_params_bda_t
 {
     sorted_array_t device_address_array;
@@ -139,14 +155,14 @@ void replacer_bda(uint3 dispatch_id: SV_DispatchThreadID, uniform replacer_param
     }
 
     uint64_t *handle_ptr = pc_bda.input_handles[gid];
-    uint64_t input_address = *handle_ptr;
+    uint64_t input_address = read_address(handle_ptr);
 
     // skip if already remapped and cached in the blacklist
     if (pc_bda.address_blacklist->get((uint64_t)handle_ptr) != input_address)
     {
         uint64_t result = map_address(pc_bda.device_address_array, input_address);
         pc_bda.address_blacklist->put((uint64_t)handle_ptr, result);
-        *pc_bda.output_handles[gid] = result != uint64_t(0) ? result : input_address;
+        write_address(pc_bda.output_handles[gid], result != uint64_t(0) ? result : input_address);
     }
 }
 

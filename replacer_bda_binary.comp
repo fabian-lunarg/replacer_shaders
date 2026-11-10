@@ -139,28 +139,22 @@ layout(push_constant, std430) uniform pc
     replacer_params_bda_t params;
 };
 
-layout(buffer_reference, buffer_reference_align = 8, std430) buffer BufferDeviceAddressPtr{ uint64_t buffer_device_address; };
-layout(buffer_reference, buffer_reference_align = 8, std430) buffer PaddedBufferDeviceAddressPtr{ uint pad; uint64_t buffer_device_address; };
+layout(buffer_reference, buffer_reference_align = 4, std430) buffer AddressWordsPtr{ uint v[2]; };
 
-//! helper to read a VkDeviceAddress from address 'ptr', read-access is 8-byte aligned
+//! helper to read a VkDeviceAddress from 4-byte aligned address 'ptr', as two 32-bit words
 uint64_t read_address(uint64_t ptr)
 {
-    return (ptr & 7UL) != 0 ? PaddedBufferDeviceAddressPtr(ptr & ~7).buffer_device_address :
-                              BufferDeviceAddressPtr(ptr).buffer_device_address;
+    AddressWordsPtr p = AddressWordsPtr(ptr);
+    return packUint2x32(uvec2(p.v[0], p.v[1]));
 }
 
-//! helper to write a VkDeviceAddress to address 'ptr', write-access is 8-byte aligned
+//! helper to write a VkDeviceAddress to 4-byte aligned address 'ptr', as two 32-bit words
 void write_address(uint64_t ptr, uint64_t value)
 {
-    if((ptr & 7UL) != 0)
-    {
-        PaddedBufferDeviceAddressPtr pad_helper = PaddedBufferDeviceAddressPtr(ptr & ~7);
-        pad_helper.buffer_device_address = value;
-    }
-    else
-    {
-        BufferDeviceAddressPtr(ptr).buffer_device_address = value;
-    }
+    AddressWordsPtr p = AddressWordsPtr(ptr);
+    uvec2 words = unpackUint2x32(value);
+    p.v[0] = words.x;
+    p.v[1] = words.y;
 }
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
