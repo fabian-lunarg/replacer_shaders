@@ -81,7 +81,7 @@ shader_group_handle_t get(const hashmap_t hashmap, const shader_group_handle_t k
     }
 }
 
-layout(buffer_reference, std430) buffer GroupHandlePtr{ shader_group_handle_t group_handle; };
+layout(buffer_reference, buffer_reference_align = 4, std430) buffer GroupHandlePtr{ shader_group_handle_t group_handle; };
 
 layout(buffer_reference, std430) buffer readonly AddressArray{ GroupHandlePtr v[]; };
 

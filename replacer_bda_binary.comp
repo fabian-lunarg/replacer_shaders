@@ -24,7 +24,7 @@ struct hashmap_item_t
     uint64_t key;
     uint64_t value;
 };
-layout(buffer_reference, std430) buffer readonly HashMapStorage{ hashmap_item_t v[]; };
+layout(buffer_reference, std430) buffer HashMapStorage{ hashmap_item_t v[]; };
 
 //! 16 bytes
 // struct hashmap_t
@@ -64,18 +64,18 @@ void hashmap_set(const HashMapPtr hashmap, const uint64_t key, const uint64_t va
         uint64_t probed_key = hashmap.storage.v[idx].key;
         if(probed_key != key)
         {
-            // hit another valid entry, keep probing
-            if(!is_null(probed_key) && !is_null(hashmap.storage.v[idx].value)) { continue; }
+            // hit another entry, keep probing
+            if(!is_null(probed_key)) { continue; }
 
-            // try to insert atomically
-            probed_key = atomicCompSwap(hashmap.storage.v[idx].key, probed_key, key);
+            // try to claim the empty slot atomically
+            probed_key = atomicCompSwap(hashmap.storage.v[idx].key, k_null_handle, key);
             if(!is_null(probed_key) && probed_key != key)
             {
-                // another thread just stole it
+                // another thread just claimed it
                 continue;
             }
-            // atomically increase size
-            atomicAdd(hashmap.size, 1);
+            // atomically increase size, unless another thread inserted the same key
+            if(is_null(probed_key)) { atomicAdd(hashmap.size, 1); }
         }
         hashmap.storage.v[idx].value = value;
         return;
@@ -102,8 +102,8 @@ struct sorted_array_t
 uint64_t map_address(const sorted_array_t array, uint64_t capture_address)
 {
     if(array.num_items == 0){ return k_null_handle; }
-    uint low = 0, high = array.num_items - 1;
-    uint mid;
+    int low = 0, high = int(array.num_items) - 1;
+    int mid;
     while(low <= high)
     {
         mid = low + (high - low) / 2;

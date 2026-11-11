@@ -58,18 +58,18 @@ public struct mutable_hashmap_t<K, V>
 
             if(!probed_key.equals(key))
             {
-                // hit another valid entry, keep probing
-                if(!probed_key.equals(K.zero()) && !item->value.equals(V.zero())) { continue; }
+                // hit another entry, keep probing
+                if(!probed_key.equals(K.zero())) { continue; }
 
-                // try to insert atomically
-                InterlockedCompareExchange<K>(item->key, probed_key, key, probed_key);
+                // try to claim the empty slot atomically
+                InterlockedCompareExchange<K>(item->key, K.zero(), key, probed_key);
                 if(!probed_key.equals(K.zero()) && !probed_key.equals(key))
                 {
-                    // another thread just stole it
+                    // another thread just claimed it
                     continue;
                 }
-                // atomically increase size
-                InterlockedAdd<uint>(base.size, 1u);
+                // atomically increase size, unless another thread inserted the same key
+                if(probed_key.equals(K.zero())) { InterlockedAdd<uint>(base.size, 1u); }
             }
             item->value = value;
             return;
